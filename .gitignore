@@ -1,0 +1,16 @@
+/cct
+/cct.exe
+/cct-gateway
+bin/
+dist/
+
+vendor/
+*.test
+*.out
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+

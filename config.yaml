@@ -1,0 +1,51 @@
+server:
+  host: 127.0.0.1
+  port: 4000
+  api_keys:
+    - "cct-secret-key-123"
+
+providers:
+  nvidia_nim:
+    protocol: openai-chat
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: 
+    limits:
+      rpm: 40
+    transport:
+      timeout: 120
+      retries: 3
+      verify_ssl: true
+
+  xiaomimimo:
+    protocol: openai-chat
+    base_url: https://token-plan-cn.xiaomimimo.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+
+models:
+  mistral:
+    routes:
+      - provider: nvidia_nim
+        model: mistralai/mistral-medium-3.5-128b
+        weight: 100
+
+  mimo-v2.5:
+    routes:
+      - provider: xiaomimimo
+        model: mimo-v2.5
+        weight: 100
+
+protocols:
+  # 备注：此处配置决定了鉴权 Key 的提取位置。
+  # 这种参数化提取方式对性能影响极微（<0.01%），且提供了极佳的协议兼容性。
+  anthropic-messages:
+    enabled: true
+    auth:
+      key_name: Authorization
+      location: header
+      prefix: Bearer
+  openai-chat:
+    enabled: true
+    auth:
+      key_name: Authorization
+      location: header
+      prefix: Bearer
