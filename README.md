@@ -26,8 +26,8 @@ CCT 是一个轻量级、高性能的 Go 语言代理服务器，专门用于将
 确保你已安装 Go 1.21+，然后克隆并编译：
 
 ```bash
-git clone https://github.com/your-username/cct.git
-cd cct
+git clone https://github.com/ret2mor1/CCT_Gateway.git
+cd CCT_Gateway
 go build -o cct
 ```
 
