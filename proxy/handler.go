@@ -73,6 +73,7 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.doBackendRequest(provider, reqBody)
 	if err != nil {
+		log.Printf("Backend request failed for %s: %v", anthropicReq.Model, err)
 		http.Error(w, "Backend request failed", http.StatusBadGateway)
 		return
 	}
@@ -133,6 +134,7 @@ func (p *Proxy) HandleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.doBackendRequest(provider, reqBody)
 	if err != nil {
+		log.Printf("Backend request failed for %s: %v", openaiReq.Model, err)
 		http.Error(w, "Backend request failed", http.StatusBadGateway)
 		return
 	}

@@ -21,11 +21,22 @@ func TranslateResponse(openaiRes *models.OpenAIResponse) *models.AnthropicRespon
 		choice := openaiRes.Choices[0]
 
 		// Handle text content
-		if choice.Message.Content != "" {
-			anthropicRes.Content = append(anthropicRes.Content, models.AnthropicBlock{
-				Type: "text",
-				Text: choice.Message.Content,
-			})
+		if choice.Message.Content != nil {
+			contentStr := ""
+			switch v := choice.Message.Content.(type) {
+			case string:
+				contentStr = v
+			default:
+				bytes, _ := json.Marshal(v)
+				contentStr = string(bytes)
+			}
+
+			if contentStr != "" {
+				anthropicRes.Content = append(anthropicRes.Content, models.AnthropicBlock{
+					Type: "text",
+					Text: contentStr,
+				})
+			}
 		}
 
 		// Handle tool calls

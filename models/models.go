@@ -54,7 +54,7 @@ type OpenAITool struct {
 
 type OpenAIMessage struct {
 	Role      string               `json:"role"`
-	Content   string               `json:"content,omitempty"`
+	Content   interface{}          `json:"content,omitempty"`
 	ToolCalls []OpenAIToolCall     `json:"tool_calls,omitempty"`
 	ToolCallID string              `json:"tool_call_id,omitempty"` // For role: "tool"
 }
@@ -99,7 +99,7 @@ type OpenAIResponse struct {
 	Choices []struct {
 		Message struct {
 			Role      string               `json:"role"`
-			Content   string               `json:"content"`
+			Content   interface{}          `json:"content"`
 			ToolCalls []OpenAIToolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
