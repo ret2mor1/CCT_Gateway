@@ -20,6 +20,14 @@ func TranslateResponse(openaiRes *models.OpenAIResponse) *models.AnthropicRespon
 	if len(openaiRes.Choices) > 0 {
 		choice := openaiRes.Choices[0]
 
+		// Handle reasoning content (DeepSeek R1 thinking mode)
+		if choice.Message.ReasoningContent != "" {
+			anthropicRes.Content = append(anthropicRes.Content, models.AnthropicThinkingBlock{
+				Type:     "thinking",
+				Thinking: choice.Message.ReasoningContent,
+			})
+		}
+
 		// Handle text content
 		if choice.Message.Content != nil {
 			contentStr := ""

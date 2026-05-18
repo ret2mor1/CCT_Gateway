@@ -53,10 +53,11 @@ type OpenAITool struct {
 }
 
 type OpenAIMessage struct {
-	Role      string               `json:"role"`
-	Content   interface{}          `json:"content,omitempty"`
-	ToolCalls []OpenAIToolCall     `json:"tool_calls,omitempty"`
-	ToolCallID string              `json:"tool_call_id,omitempty"` // For role: "tool"
+	Role             string               `json:"role"`
+	Content          interface{}          `json:"content,omitempty"`
+	ReasoningContent string               `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIToolCall     `json:"tool_calls,omitempty"`
+	ToolCallID       string               `json:"tool_call_id,omitempty"` // For role: "tool"
 }
 
 type OpenAIToolCall struct {
@@ -85,6 +86,11 @@ type AnthropicBlock struct {
 	Text string `json:"text"`
 }
 
+type AnthropicThinkingBlock struct {
+	Type     string `json:"type"` // "thinking"
+	Thinking string `json:"thinking"`
+}
+
 type AnthropicUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
@@ -98,9 +104,10 @@ type OpenAIResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
 		Message struct {
-			Role      string               `json:"role"`
-			Content   interface{}          `json:"content"`
-			ToolCalls []OpenAIToolCall `json:"tool_calls"`
+			Role             string               `json:"role"`
+			Content          interface{}          `json:"content"`
+			ReasoningContent string               `json:"reasoning_content,omitempty"`
+			ToolCalls        []OpenAIToolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`

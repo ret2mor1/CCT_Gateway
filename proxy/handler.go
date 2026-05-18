@@ -68,12 +68,14 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	openaiReq := translator.TranslateRequest(&anthropicReq, route.Model)
 	reqBody, _ := json.Marshal(openaiReq)
 
+	// log.Printf("Raw Anthropic Request: %s", string(bodyBytes))
 	log.Printf("Proxying Anthropic request: %s -> %s (via %s)", 
 		anthropicReq.Model, route.Model, route.Provider)
+	// log.Printf("Translated OpenAI Request: %s", string(reqBody))
 
 	resp, err := p.doBackendRequest(provider, reqBody)
 	if err != nil {
-		log.Printf("Backend request failed for %s: %v", anthropicReq.Model, err)
+		// log.Printf("Backend request failed for %s: %v", anthropicReq.Model, err)
 		http.Error(w, "Backend request failed", http.StatusBadGateway)
 		return
 	}
@@ -84,10 +86,18 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var lastUserPrompt string
+	for j := len(anthropicReq.Messages) - 1; j >= 0; j-- {
+		if anthropicReq.Messages[j].Role == "user" {
+			lastUserPrompt = translator.ExtractText(anthropicReq.Messages[j].Content)
+			break
+		}
+	}
+
 	if anthropicReq.Stream {
-		p.handleAnthropicStreamingResponse(w, resp)
+		p.handleAnthropicStreamingResponse(w, resp, lastUserPrompt)
 	} else {
-		p.handleAnthropicStandardResponse(w, resp)
+		p.handleAnthropicStandardResponse(w, resp, lastUserPrompt)
 	}
 }
 
@@ -288,7 +298,7 @@ func (p *Proxy) selectRoute(m config.Model) *config.Route {
 	return &m.Routes[0]
 }
 
-func (p *Proxy) handleAnthropicStandardResponse(w http.ResponseWriter, resp *http.Response) {
+func (p *Proxy) handleAnthropicStandardResponse(w http.ResponseWriter, resp *http.Response, lastUserPrompt string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("Failed to read backend response: %v", err)
@@ -301,6 +311,21 @@ func (p *Proxy) handleAnthropicStandardResponse(w http.ResponseWriter, resp *htt
 		log.Printf("Failed to decode backend response: %v", err)
 		http.Error(w, "Failed to decode backend response", http.StatusInternalServerError)
 		return
+	}
+
+	if len(openaiRes.Choices) > 0 {
+		choice := openaiRes.Choices[0]
+		contentStr := ""
+		switch v := choice.Message.Content.(type) {
+		case string:
+			contentStr = v
+		default:
+			bytes, _ := json.Marshal(v)
+			contentStr = string(bytes)
+		}
+		if choice.Message.ReasoningContent != "" && contentStr != "" {
+			translator.CacheReasoning(lastUserPrompt, contentStr, choice.Message.ReasoningContent)
+		}
 	}
 
 	anthropicRes := translator.TranslateResponse(&openaiRes)
@@ -330,7 +355,7 @@ func (p *Proxy) handleOpenAIStandardResponse(w http.ResponseWriter, resp *http.R
 	json.NewEncoder(w).Encode(openaiRes)
 }
 
-func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *http.Response) {
+func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *http.Response, lastUserPrompt string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -356,6 +381,10 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 	var activeToolID string
 	var currentBlockIndex int
 	var textBlockStarted bool
+	var thinkingBlockStarted bool
+	var thinkingBlockStopped bool
+	var fullTextBuilder strings.Builder
+	var fullReasoningBuilder strings.Builder
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -378,7 +407,8 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 
 		type Choice struct {
 			Delta struct {
-				Content   string `json:"content"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content,omitempty"`
 				ToolCalls []struct {
 					Index    int    `json:"index"`
 					ID       string `json:"id"`
@@ -402,12 +432,46 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 			choice := fullChunk.Choices[0]
 			delta := choice.Delta
 
+			// Handle reasoning content (thinking block)
+			if delta.ReasoningContent != "" {
+				fullReasoningBuilder.WriteString(delta.ReasoningContent)
+				if !thinkingBlockStarted {
+					p.sendEvent(w, flusher, "content_block_start", map[string]interface{}{
+						"type":  "content_block_start",
+						"index": 0,
+						"content_block": map[string]string{
+							"type":     "thinking",
+							"thinking": "",
+						},
+					})
+					thinkingBlockStarted = true
+				}
+				p.sendEvent(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": 0,
+					"delta": map[string]interface{}{
+						"type":     "thinking_delta",
+						"thinking": delta.ReasoningContent,
+					},
+				})
+			}
+
+			// Handle text content
 			if delta.Content != "" {
 				if activeToolID == "" {
-					if currentBlockIndex == 0 && !textBlockStarted {
+					fullTextBuilder.WriteString(delta.Content)
+					if thinkingBlockStarted && !thinkingBlockStopped {
+						p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
+							"type":  "content_block_stop",
+							"index": 0,
+						})
+						thinkingBlockStopped = true
+						currentBlockIndex = 1
+					}
+					if !textBlockStarted {
 						p.sendEvent(w, flusher, "content_block_start", map[string]interface{}{
 							"type":  "content_block_start",
-							"index": 0,
+							"index": currentBlockIndex,
 							"content_block": map[string]string{
 								"type": "text",
 								"text": "",
@@ -417,7 +481,7 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 					}
 					p.sendEvent(w, flusher, "content_block_delta", map[string]interface{}{
 						"type":  "content_block_delta",
-						"index": 0,
+						"index": currentBlockIndex,
 						"delta": map[string]string{
 							"type": "text_delta",
 							"text": delta.Content,
@@ -426,7 +490,17 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 				}
 			}
 
+			// Handle tool calls
 			if len(delta.ToolCalls) > 0 {
+				if thinkingBlockStarted && !thinkingBlockStopped {
+					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
+						"type":  "content_block_stop",
+						"index": 0,
+					})
+					thinkingBlockStopped = true
+					currentBlockIndex = 1
+				}
+
 				tc := delta.ToolCalls[0]
 				if tc.ID != "" {
 					activeToolID = tc.ID
@@ -455,12 +529,25 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 			}
 
 			if choice.FinishReason != "" {
+				if thinkingBlockStarted && !thinkingBlockStopped {
+					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
+						"type":  "content_block_stop",
+						"index": 0,
+					})
+					thinkingBlockStopped = true
+				}
+
 				if activeToolID != "" {
 					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
 						"type":  "content_block_stop",
 						"index": currentBlockIndex,
 					})
 					activeToolID = ""
+				} else if textBlockStarted {
+					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
+						"type":  "content_block_stop",
+						"index": currentBlockIndex,
+					})
 				} else if currentBlockIndex == 0 {
 					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
 						"type":  "content_block_stop",
@@ -487,6 +574,13 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 	p.sendEvent(w, flusher, "message_stop", map[string]interface{}{
 		"type": "message_stop",
 	})
+
+	// Cache reasoning content for future turns
+	fullText := fullTextBuilder.String()
+	fullReasoning := fullReasoningBuilder.String()
+	if fullText != "" && fullReasoning != "" {
+		translator.CacheReasoning(lastUserPrompt, fullText, fullReasoning)
+	}
 }
 
 func (p *Proxy) sendEvent(w io.Writer, flusher http.Flusher, event string, data interface{}) {

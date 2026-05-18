@@ -22,16 +22,38 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 	if anthropicReq.Tools != nil {
 		if tools, ok := anthropicReq.Tools.([]interface{}); ok {
 			for _, t := range tools {
-				openaiReq.Tools = append(openaiReq.Tools, models.OpenAITool{
-					Type:     "function",
-					Function: t,
-				})
+				// Translate Anthropic tool definition to OpenAI function format
+				if toolMap, ok := t.(map[string]interface{}); ok {
+					newFunction := make(map[string]interface{})
+					for k, v := range toolMap {
+						if k == "input_schema" {
+							newFunction["parameters"] = v
+						} else if k == "name" {
+							if s, ok := v.(string); ok {
+								newFunction[k] = strings.TrimSpace(s)
+							} else {
+								newFunction[k] = v
+							}
+						} else {
+							newFunction[k] = v
+						}
+					}
+					openaiReq.Tools = append(openaiReq.Tools, models.OpenAITool{
+						Type:     "function",
+						Function: newFunction,
+					})
+				} else {
+					openaiReq.Tools = append(openaiReq.Tools, models.OpenAITool{
+						Type:     "function",
+						Function: t,
+					})
+				}
 			}
 		}
 	}
 
 	// Map system prompt
-	systemStr := extractText(anthropicReq.System)
+	systemStr := ExtractText(anthropicReq.System)
 	if systemStr != "" {
 		openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
 			Role:    "system",
@@ -40,27 +62,47 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 	}
 
 	// Map messages
-	for _, msg := range anthropicReq.Messages {
+	for idx, msg := range anthropicReq.Messages {
 		switch v := msg.Content.(type) {
 		case string:
 			content := v
 			if msg.Role == "assistant" && content == "" {
 				content = "."
 			}
-			openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
+			openaiMsg := models.OpenAIMessage{
 				Role:    msg.Role,
 				Content: content,
-			})
+			}
+			if msg.Role == "assistant" {
+				var precedingUser string
+				for j := idx - 1; j >= 0; j-- {
+					if anthropicReq.Messages[j].Role == "user" {
+						precedingUser = ExtractText(anthropicReq.Messages[j].Content)
+						break
+					}
+				}
+				if precedingUser != "" {
+					if cached := GetCachedReasoning(precedingUser, content); cached != "" {
+						openaiMsg.ReasoningContent = cached
+					}
+				}
+			}
+			openaiReq.Messages = append(openaiReq.Messages, openaiMsg)
 		case []interface{}:
 			textBuilder := strings.Builder{}
 			var toolCalls []models.OpenAIToolCall
 			var toolResultID string
 			var toolResultContent string
+			var reasoningBuilder strings.Builder
 
 			for _, block := range v {
 				if b, ok := block.(map[string]interface{}); ok {
 					blockType, _ := b["type"].(string)
 					switch blockType {
+					case "thinking":
+						if t, ok := b["thinking"].(string); ok {
+							reasoningBuilder.WriteString(t)
+						}
 					case "text":
 						if t, ok := b["text"].(string); ok {
 							textBuilder.WriteString(t)
@@ -77,7 +119,7 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 								Name      string `json:"name"`
 								Arguments string `json:"arguments"`
 							}{
-								Name:      name,
+								Name:      strings.TrimSpace(name),
 								Arguments: string(args),
 							},
 						})
@@ -104,14 +146,32 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 				})
 			} else {
 				content := textBuilder.String()
-			if msg.Role == "assistant" && content == "" && len(toolCalls) == 0 {
-				content = "."
-			}
-				openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
+				if msg.Role == "assistant" && content == "" && len(toolCalls) == 0 {
+					content = "."
+				}
+				openaiMsg := models.OpenAIMessage{
 					Role:      msg.Role,
 					Content:   content,
 					ToolCalls: toolCalls,
-				})
+				}
+				reasoningStr := reasoningBuilder.String()
+				if reasoningStr != "" {
+					openaiMsg.ReasoningContent = reasoningStr
+				} else if msg.Role == "assistant" {
+					var precedingUser string
+					for j := idx - 1; j >= 0; j-- {
+						if anthropicReq.Messages[j].Role == "user" {
+							precedingUser = ExtractText(anthropicReq.Messages[j].Content)
+							break
+						}
+					}
+					if precedingUser != "" {
+						if cached := GetCachedReasoning(precedingUser, content); cached != "" {
+							openaiMsg.ReasoningContent = cached
+						}
+					}
+				}
+				openaiReq.Messages = append(openaiReq.Messages, openaiMsg)
 			}
 		}
 	}
@@ -119,7 +179,7 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 	return openaiReq
 }
 
-func extractText(content interface{}) string {
+func ExtractText(content interface{}) string {
 	if content == nil {
 		return ""
 	}
