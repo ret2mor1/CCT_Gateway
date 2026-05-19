@@ -89,11 +89,11 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 			}
 			openaiReq.Messages = append(openaiReq.Messages, openaiMsg)
 		case []interface{}:
-			textBuilder := strings.Builder{}
-			var toolCalls []models.OpenAIToolCall
-			var toolResultID string
-			var toolResultContent string
-			var reasoningBuilder strings.Builder
+			var assistantText strings.Builder
+			var assistantReasoning strings.Builder
+			var assistantToolCalls []models.OpenAIToolCall
+			var userText strings.Builder
+			var toolResultMsgs []models.OpenAIMessage
 
 			for _, block := range v {
 				if b, ok := block.(map[string]interface{}); ok {
@@ -101,18 +101,22 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 					switch blockType {
 					case "thinking":
 						if t, ok := b["thinking"].(string); ok {
-							reasoningBuilder.WriteString(t)
+							assistantReasoning.WriteString(t)
 						}
 					case "text":
 						if t, ok := b["text"].(string); ok {
-							textBuilder.WriteString(t)
+							if msg.Role == "assistant" {
+								assistantText.WriteString(t)
+							} else {
+								userText.WriteString(t)
+							}
 						}
 					case "tool_use":
 						id, _ := b["id"].(string)
 						name, _ := b["name"].(string)
 						input, _ := b["input"]
 						args, _ := json.Marshal(input)
-						toolCalls = append(toolCalls, models.OpenAIToolCall{
+						assistantToolCalls = append(assistantToolCalls, models.OpenAIToolCall{
 							ID:   id,
 							Type: "function",
 							Function: struct {
@@ -124,40 +128,38 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 							},
 						})
 					case "tool_result":
-						toolResultID, _ = b["tool_use_id"].(string)
+						trID, _ := b["tool_use_id"].(string)
 						content := b["content"]
 						contentStr := ""
 						if s, ok := content.(string); ok {
 							contentStr = s
-						} else {
+						} else if content != nil {
 							cBytes, _ := json.Marshal(content)
 							contentStr = string(cBytes)
 						}
-						toolResultContent = contentStr
+						toolResultMsgs = append(toolResultMsgs, models.OpenAIMessage{
+							Role:       "tool",
+							ToolCallID: trID,
+							Content:    contentStr,
+						})
 					}
 				}
 			}
 
-			if toolResultID != "" {
-				openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
-					Role:       "tool",
-					ToolCallID: toolResultID,
-					Content:    toolResultContent,
-				})
-			} else {
-				content := textBuilder.String()
-				if msg.Role == "assistant" && content == "" && len(toolCalls) == 0 {
+			if msg.Role == "assistant" {
+				content := assistantText.String()
+				if content == "" && len(assistantToolCalls) == 0 {
 					content = "."
 				}
 				openaiMsg := models.OpenAIMessage{
-					Role:      msg.Role,
+					Role:      "assistant",
 					Content:   content,
-					ToolCalls: toolCalls,
+					ToolCalls: assistantToolCalls,
 				}
-				reasoningStr := reasoningBuilder.String()
+				reasoningStr := assistantReasoning.String()
 				if reasoningStr != "" {
 					openaiMsg.ReasoningContent = reasoningStr
-				} else if msg.Role == "assistant" {
+				} else {
 					var precedingUser string
 					for j := idx - 1; j >= 0; j-- {
 						if anthropicReq.Messages[j].Role == "user" {
@@ -172,6 +174,31 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 					}
 				}
 				openaiReq.Messages = append(openaiReq.Messages, openaiMsg)
+			} else if msg.Role == "user" {
+				if len(toolResultMsgs) > 0 {
+					openaiReq.Messages = append(openaiReq.Messages, toolResultMsgs...)
+				}
+				content := userText.String()
+				if content != "" || len(toolResultMsgs) == 0 {
+					if content != "" {
+						openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
+							Role:    "user",
+							Content: content,
+						})
+					} else {
+						// empty string fallback
+						openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
+							Role:    "user",
+							Content: ".",
+						})
+					}
+				}
+			} else {
+				content := userText.String() + assistantText.String()
+				openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
+					Role:    msg.Role,
+					Content: content,
+				})
 			}
 		}
 	}
