@@ -83,7 +83,7 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 				}
 				if precedingUser != "" {
 					if cached := GetCachedReasoning(precedingUser, content); cached != "" {
-						openaiMsg.ReasoningContent = cached
+						// openaiMsg.ReasoningContent = cached
 					}
 				}
 			}
@@ -169,7 +169,7 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 					}
 					if precedingUser != "" {
 						if cached := GetCachedReasoning(precedingUser, content); cached != "" {
-							openaiMsg.ReasoningContent = cached
+							// openaiMsg.ReasoningContent = cached // 暂时禁用：避免上下文污染，模型可能在多轮对话中收到不属于当前上下文的 reasoning
 						}
 					}
 				}
