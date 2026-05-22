@@ -2,17 +2,20 @@ package limiter
 
 import (
 	"cct/config"
+	"context"
 	"log"
 	"time"
 )
 
 type Manager struct {
-	chans map[string]chan struct{}
+	chans  map[string]chan struct{}
+	stopCh chan struct{}
 }
 
 func NewManager(providers map[string]config.Provider) *Manager {
 	m := &Manager{
-		chans: make(map[string]chan struct{}),
+		chans:  make(map[string]chan struct{}),
+		stopCh: make(chan struct{}),
 	}
 
 	for name, provider := range providers {
@@ -27,12 +30,18 @@ func NewManager(providers map[string]config.Provider) *Manager {
 
 			// Refill periodically
 			go func(pName string, rpm int, c chan struct{}) {
-				interval := 60 * 1000 / rpm
-				ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
-				for range ticker.C {
+				interval := time.Duration(float64(time.Minute) / float64(rpm))
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
 					select {
-					case c <- struct{}{}:
-					default:
+					case <-m.stopCh:
+						return
+					case <-ticker.C:
+						select {
+						case c <- struct{}{}:
+						default:
+						}
 					}
 				}
 			}(name, provider.Limits.RPM, ch)
@@ -42,8 +51,20 @@ func NewManager(providers map[string]config.Provider) *Manager {
 	return m
 }
 
-func (m *Manager) Wait(providerName string) {
-	if ch, exists := m.chans[providerName]; exists {
-		<-ch
+// Wait blocks until a token is available for the given provider or the context is done.
+// If the context is cancelled (e.g. client disconnected), the wait is silently abandoned.
+func (m *Manager) Wait(ctx context.Context, providerName string) {
+	ch, exists := m.chans[providerName]
+	if !exists {
+		return
 	}
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+}
+
+// Stop terminates all refill goroutines and releases resources.
+func (m *Manager) Stop() {
+	close(m.stopCh)
 }

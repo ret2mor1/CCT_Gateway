@@ -62,14 +62,14 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rate limiting
-	p.limiter.Wait(route.Provider)
+	p.limiter.Wait(r.Context(), route.Provider)
 
 	// Translate request
 	openaiReq := translator.TranslateRequest(&anthropicReq, route.Model)
 	reqBody, _ := json.Marshal(openaiReq)
 
 	// log.Printf("Raw Anthropic Request: %s", string(bodyBytes))
-	log.Printf("Proxying Anthropic request: %s -> %s (via %s)", 
+	log.Printf("Proxying Anthropic request: %s -> %s (via %s)",
 		anthropicReq.Model, route.Model, route.Provider)
 	// log.Printf("Translated OpenAI Request: %s", string(reqBody))
 
@@ -86,18 +86,10 @@ func (p *Proxy) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var lastUserPrompt string
-	for j := len(anthropicReq.Messages) - 1; j >= 0; j-- {
-		if anthropicReq.Messages[j].Role == "user" {
-			lastUserPrompt = translator.ExtractText(anthropicReq.Messages[j].Content)
-			break
-		}
-	}
-
 	if anthropicReq.Stream {
-		p.handleAnthropicStreamingResponse(w, resp, lastUserPrompt)
+		p.handleAnthropicStreamingResponse(w, resp, &anthropicReq)
 	} else {
-		p.handleAnthropicStandardResponse(w, resp, lastUserPrompt)
+		p.handleAnthropicStandardResponse(w, resp, &anthropicReq)
 	}
 }
 
@@ -132,14 +124,14 @@ func (p *Proxy) HandleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rate limiting
-	p.limiter.Wait(route.Provider)
+	p.limiter.Wait(r.Context(), route.Provider)
 
 	// Update model name to backend's model
 	originalModel := openaiReq.Model
 	openaiReq.Model = route.Model
 	reqBody, _ := json.Marshal(openaiReq)
 
-	log.Printf("Proxying OpenAI request: %s -> %s (via %s)", 
+	log.Printf("Proxying OpenAI request: %s -> %s (via %s)",
 		originalModel, route.Model, route.Provider)
 
 	resp, err := p.doBackendRequest(provider, reqBody)
@@ -286,7 +278,6 @@ func (p *Proxy) selectRoute(m config.Model) *config.Route {
 		return &m.Routes[0]
 	}
 
-	rand.Seed(time.Now().UnixNano())
 	r := rand.Intn(totalWeight)
 	current := 0
 	for _, route := range m.Routes {
@@ -298,7 +289,26 @@ func (p *Proxy) selectRoute(m config.Model) *config.Route {
 	return &m.Routes[0]
 }
 
-func (p *Proxy) handleAnthropicStandardResponse(w http.ResponseWriter, resp *http.Response, lastUserPrompt string) {
+// buildResponseCacheKey computes the cache key for a newly generated response.
+// The key is based on the system prompt, all messages in the request, and the
+// assistant's newly generated reply, matching the lookup key computed in TranslateRequest.
+func buildResponseCacheKey(anthropicReq *models.AnthropicRequest, assistantText string) string {
+	var contextMsgs []translator.ContextMessage
+	for _, msg := range anthropicReq.Messages {
+		contextMsgs = append(contextMsgs, translator.ContextMessage{
+			Role: msg.Role,
+			Text: translator.ExtractMessageText(msg),
+		})
+	}
+	contextMsgs = append(contextMsgs, translator.ContextMessage{
+		Role: "assistant",
+		Text: assistantText,
+	})
+	systemText := translator.ExtractText(anthropicReq.System)
+	return translator.ComputeContextKey(systemText, contextMsgs)
+}
+
+func (p *Proxy) handleAnthropicStandardResponse(w http.ResponseWriter, resp *http.Response, anthropicReq *models.AnthropicRequest) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("Failed to read backend response: %v", err)
@@ -315,16 +325,28 @@ func (p *Proxy) handleAnthropicStandardResponse(w http.ResponseWriter, resp *htt
 
 	if len(openaiRes.Choices) > 0 {
 		choice := openaiRes.Choices[0]
-		contentStr := ""
-		switch v := choice.Message.Content.(type) {
-		case string:
-			contentStr = v
-		default:
-			bytes, _ := json.Marshal(v)
-			contentStr = string(bytes)
-		}
-		if choice.Message.ReasoningContent != "" && contentStr != "" {
-			translator.CacheReasoning(lastUserPrompt, contentStr, choice.Message.ReasoningContent)
+		if choice.Message.ReasoningContent != "" {
+			var parts []string
+			contentStr := ""
+			if choice.Message.Content != nil {
+				switch v := choice.Message.Content.(type) {
+				case string:
+					contentStr = v
+				default:
+					bytes, _ := json.Marshal(v)
+					contentStr = string(bytes)
+				}
+			}
+			if contentStr != "" {
+				parts = append(parts, contentStr)
+			}
+			for _, tc := range choice.Message.ToolCalls {
+				parts = append(parts, "tool:"+strings.TrimSpace(tc.Function.Name)+":"+tc.ID)
+			}
+			assistantText := strings.Join(parts, "|")
+
+			cacheKey := buildResponseCacheKey(anthropicReq, assistantText)
+			translator.CacheReasoning(cacheKey, choice.Message.ReasoningContent)
 		}
 	}
 
@@ -355,7 +377,7 @@ func (p *Proxy) handleOpenAIStandardResponse(w http.ResponseWriter, resp *http.R
 	json.NewEncoder(w).Encode(openaiRes)
 }
 
-func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *http.Response, lastUserPrompt string) {
+func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *http.Response, anthropicReq *models.AnthropicRequest) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -379,12 +401,14 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 
 	reader := bufio.NewReader(resp.Body)
 	var activeToolID string
-	var currentBlockIndex int
+	var nextBlockIndex int
+	var currentToolBlockIndex int
 	var textBlockStarted bool
 	var thinkingBlockStarted bool
 	var thinkingBlockStopped bool
 	var fullTextBuilder strings.Builder
 	var fullReasoningBuilder strings.Builder
+	var toolCallsInfo []string
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -438,7 +462,7 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 				if !thinkingBlockStarted {
 					p.sendEvent(w, flusher, "content_block_start", map[string]interface{}{
 						"type":  "content_block_start",
-						"index": 0,
+						"index": nextBlockIndex,
 						"content_block": map[string]string{
 							"type":     "thinking",
 							"thinking": "",
@@ -448,7 +472,7 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 				}
 				p.sendEvent(w, flusher, "content_block_delta", map[string]interface{}{
 					"type":  "content_block_delta",
-					"index": 0,
+					"index": nextBlockIndex,
 					"delta": map[string]interface{}{
 						"type":     "thinking_delta",
 						"thinking": delta.ReasoningContent,
@@ -463,15 +487,15 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 					if thinkingBlockStarted && !thinkingBlockStopped {
 						p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
 							"type":  "content_block_stop",
-							"index": 0,
+							"index": nextBlockIndex,
 						})
 						thinkingBlockStopped = true
-						currentBlockIndex = 1
+						nextBlockIndex++
 					}
 					if !textBlockStarted {
 						p.sendEvent(w, flusher, "content_block_start", map[string]interface{}{
 							"type":  "content_block_start",
-							"index": currentBlockIndex,
+							"index": nextBlockIndex,
 							"content_block": map[string]string{
 								"type": "text",
 								"text": "",
@@ -481,7 +505,7 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 					}
 					p.sendEvent(w, flusher, "content_block_delta", map[string]interface{}{
 						"type":  "content_block_delta",
-						"index": currentBlockIndex,
+						"index": nextBlockIndex,
 						"delta": map[string]string{
 							"type": "text_delta",
 							"text": delta.Content,
@@ -495,36 +519,49 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 				if thinkingBlockStarted && !thinkingBlockStopped {
 					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
 						"type":  "content_block_stop",
-						"index": 0,
+						"index": nextBlockIndex,
 					})
 					thinkingBlockStopped = true
-					currentBlockIndex = 1
+					nextBlockIndex++
 				}
 
-				tc := delta.ToolCalls[0]
-				if tc.ID != "" {
-					activeToolID = tc.ID
-					currentBlockIndex++
-					p.sendEvent(w, flusher, "content_block_start", map[string]interface{}{
-						"type":  "content_block_start",
-						"index": currentBlockIndex,
-						"content_block": map[string]interface{}{
-							"type": "tool_use",
-							"id":   tc.ID,
-							"name": tc.Function.Name,
-							"input": map[string]interface{}{},
-						},
+				// Close any open text block before starting tool blocks
+				if textBlockStarted {
+					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
+						"type":  "content_block_stop",
+						"index": nextBlockIndex,
 					})
+					textBlockStarted = false
+					nextBlockIndex++
 				}
-				if tc.Function.Arguments != "" {
-					p.sendEvent(w, flusher, "content_block_delta", map[string]interface{}{
-						"type":  "content_block_delta",
-						"index": currentBlockIndex,
-						"delta": map[string]interface{}{
-							"type":             "input_json_delta",
-							"partial_json": tc.Function.Arguments,
-						},
-					})
+
+				for _, tc := range delta.ToolCalls {
+					if tc.ID != "" {
+						activeToolID = tc.ID
+						toolCallsInfo = append(toolCallsInfo, "tool:"+strings.TrimSpace(tc.Function.Name)+":"+tc.ID)
+						currentToolBlockIndex = nextBlockIndex
+						nextBlockIndex++
+						p.sendEvent(w, flusher, "content_block_start", map[string]interface{}{
+							"type":  "content_block_start",
+							"index": currentToolBlockIndex,
+							"content_block": map[string]interface{}{
+								"type":  "tool_use",
+								"id":    tc.ID,
+								"name":  tc.Function.Name,
+								"input": map[string]interface{}{},
+							},
+						})
+					}
+					if tc.Function.Arguments != "" {
+						p.sendEvent(w, flusher, "content_block_delta", map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": currentToolBlockIndex,
+							"delta": map[string]interface{}{
+								"type":         "input_json_delta",
+								"partial_json": tc.Function.Arguments,
+							},
+						})
+					}
 				}
 			}
 
@@ -532,7 +569,7 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 				if thinkingBlockStarted && !thinkingBlockStopped {
 					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
 						"type":  "content_block_stop",
-						"index": 0,
+						"index": nextBlockIndex,
 					})
 					thinkingBlockStopped = true
 				}
@@ -540,18 +577,18 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 				if activeToolID != "" {
 					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
 						"type":  "content_block_stop",
-						"index": currentBlockIndex,
+						"index": currentToolBlockIndex,
 					})
 					activeToolID = ""
 				} else if textBlockStarted {
 					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
 						"type":  "content_block_stop",
-						"index": currentBlockIndex,
+						"index": nextBlockIndex,
 					})
-				} else if currentBlockIndex == 0 {
+				} else if nextBlockIndex > 0 {
 					p.sendEvent(w, flusher, "content_block_stop", map[string]interface{}{
 						"type":  "content_block_stop",
-						"index": 0,
+						"index": nextBlockIndex - 1,
 					})
 				}
 
@@ -576,10 +613,18 @@ func (p *Proxy) handleAnthropicStreamingResponse(w http.ResponseWriter, resp *ht
 	})
 
 	// Cache reasoning content for future turns
-	fullText := fullTextBuilder.String()
 	fullReasoning := fullReasoningBuilder.String()
-	if fullText != "" && fullReasoning != "" {
-		translator.CacheReasoning(lastUserPrompt, fullText, fullReasoning)
+	if fullReasoning != "" {
+		var parts []string
+		textStr := fullTextBuilder.String()
+		if textStr != "" {
+			parts = append(parts, textStr)
+		}
+		parts = append(parts, toolCallsInfo...)
+		assistantText := strings.Join(parts, "|")
+
+		cacheKey := buildResponseCacheKey(anthropicReq, assistantText)
+		translator.CacheReasoning(cacheKey, fullReasoning)
 	}
 }
 

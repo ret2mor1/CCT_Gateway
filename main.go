@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
@@ -56,6 +58,16 @@ func main() {
 
 	// Register models list
 	http.HandleFunc("/v1/models", p.HandleListModels)
+
+	// Graceful shutdown
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		log.Println("Shutting down...")
+		l.Stop()
+		os.Exit(0)
+	}()
 
 	log.Fatal(http.ListenAndServe(addr, nil))
 }

@@ -73,20 +73,8 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 				Role:    msg.Role,
 				Content: content,
 			}
-			if msg.Role == "assistant" {
-				var precedingUser string
-				for j := idx - 1; j >= 0; j-- {
-					if anthropicReq.Messages[j].Role == "user" {
-						precedingUser = ExtractText(anthropicReq.Messages[j].Content)
-						break
-					}
-				}
-				if precedingUser != "" {
-					if cached := GetCachedReasoning(precedingUser, content); cached != "" {
-						// openaiMsg.ReasoningContent = cached
-					}
-				}
-			}
+			// Plain-text assistant messages have no tool calls, so we do not send reasoning_content
+			// to avoid context pollution/repetition on reasoning backends.
 			openaiReq.Messages = append(openaiReq.Messages, openaiMsg)
 		case []interface{}:
 			var assistantText strings.Builder
@@ -156,42 +144,38 @@ func TranslateRequest(anthropicReq *models.AnthropicRequest, remoteModel string)
 					Content:   content,
 					ToolCalls: assistantToolCalls,
 				}
-				reasoningStr := assistantReasoning.String()
-				if reasoningStr != "" {
-					openaiMsg.ReasoningContent = reasoningStr
-				} else {
-					var precedingUser string
-					for j := idx - 1; j >= 0; j-- {
-						if anthropicReq.Messages[j].Role == "user" {
-							precedingUser = ExtractText(anthropicReq.Messages[j].Content)
-							break
-						}
-					}
-					if precedingUser != "" {
-						if cached := GetCachedReasoning(precedingUser, content); cached != "" {
-							// openaiMsg.ReasoningContent = cached // 暂时禁用：避免上下文污染，模型可能在多轮对话中收到不属于当前上下文的 reasoning
+				// Only include reasoning_content if this assistant message contains tool calls,
+				// which is required by some reasoning backends (like DeepSeek-R1) to avoid a 400 error.
+				// For non-tool-calling turns, omitting reasoning_content prevents context pollution.
+				if len(assistantToolCalls) > 0 {
+					reasoningStr := assistantReasoning.String()
+					if reasoningStr != "" {
+						openaiMsg.ReasoningContent = reasoningStr
+					} else {
+						// No thinking blocks in history -- attempt cache lookup
+						contextMsgs := buildContextUpTo(anthropicReq.Messages, idx)
+						cacheKey := ComputeContextKey(systemStr, contextMsgs)
+						if cached := GetCachedReasoning(cacheKey); cached != "" {
+							openaiMsg.ReasoningContent = cached
 						}
 					}
 				}
 				openaiReq.Messages = append(openaiReq.Messages, openaiMsg)
 			} else if msg.Role == "user" {
+				content := userText.String()
+				if content != "" {
+					openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
+						Role:    "user",
+						Content: content,
+					})
+				} else if len(toolResultMsgs) == 0 {
+					openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
+						Role:    "user",
+						Content: ".",
+					})
+				}
 				if len(toolResultMsgs) > 0 {
 					openaiReq.Messages = append(openaiReq.Messages, toolResultMsgs...)
-				}
-				content := userText.String()
-				if content != "" || len(toolResultMsgs) == 0 {
-					if content != "" {
-						openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
-							Role:    "user",
-							Content: content,
-						})
-					} else {
-						// empty string fallback
-						openaiReq.Messages = append(openaiReq.Messages, models.OpenAIMessage{
-							Role:    "user",
-							Content: ".",
-						})
-					}
 				}
 			} else {
 				content := userText.String() + assistantText.String()
